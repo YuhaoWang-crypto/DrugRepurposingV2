@@ -247,3 +247,24 @@ def align_expr_and_meta(df_expr: pd.DataFrame, df_meta: pd.DataFrame) -> Tuple[p
     meta2 = df_meta.loc[common].copy()
     meta2['expr_col'] = df_expr2.columns.tolist()
     return df_expr2, meta2
+
+
+import numpy as np
+
+def int_like_fraction(df: pd.DataFrame, max_cells: int = 20000) -> float:
+    """Estimate fraction of values that are (almost) integers.
+    Used to guess whether a matrix looks like counts vs normalized expression.
+    """
+    if df is None or df.empty:
+        return 0.0
+
+    sub = df.iloc[: min(200, df.shape[0]), : min(20, df.shape[1])]
+    vals = pd.to_numeric(sub.stack(), errors="coerce").dropna().values
+    if vals.size == 0:
+        return 0.0
+
+    if vals.size > max_cells:
+        rng = np.random.default_rng(0)
+        vals = rng.choice(vals, size=max_cells, replace=False)
+
+    return float(np.mean(np.isclose(vals, np.round(vals), atol=1e-6)))
