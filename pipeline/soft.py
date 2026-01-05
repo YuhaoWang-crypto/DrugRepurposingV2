@@ -119,3 +119,20 @@ def parse_gse_family_soft_gz(path: Path) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = "" if c != "characteristics_kv" else [{} for _ in range(df.shape[0])]
     return df
+
+
+
+# -----------------------------------------------------------------------------
+# Backward-compatible aliases
+# -----------------------------------------------------------------------------
+# The Streamlit app imports these simple names. Keep them as wrappers so that
+# internal refactors (e.g., `download_family_soft` / `parse_gse_family_soft_gz`)
+# don't break the public API.
+
+def download_soft(gse: str, raw_gse_dir, timeout: int = 240):
+    """Compatibility wrapper for `download_family_soft`."""
+    return download_family_soft(gse, raw_gse_dir, timeout=timeout)
+
+def parse_soft(soft_gz_path):
+    """Compatibility wrapper for `parse_gse_family_soft_gz`."""
+    return parse_gse_family_soft_gz(soft_gz_path)
