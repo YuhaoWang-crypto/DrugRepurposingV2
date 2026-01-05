@@ -1,4 +1,3 @@
-\
 from __future__ import annotations
 
 import gzip
@@ -8,140 +7,104 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
+import pandas as pd
 import requests
 
 
-def safe_mkdir(p: Path) -> Path:
+def safe_mkdir(p: Union[str, Path]) -> Path:
+    p = Path(p)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def slugify(s: str) -> str:
-    s = s.strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = re.sub(r"-+", "-", s).strip("-")
-    return s or "x"
+def write_json(path: Union[str, Path], obj: Any) -> None:
+    Path(path).write_text(json.dumps(obj, indent=2, ensure_ascii=False))
 
 
-def read_text_maybe_gz(path: Path, encoding: str = "utf-8", errors: str = "replace") -> str:
+def read_text_maybe_gz(path: Union[str, Path]) -> str:
+    path = Path(path)
     if str(path).endswith(".gz"):
-        with gzip.open(path, "rt", encoding=encoding, errors=errors) as f:
+        with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as f:
             return f.read()
-    return path.read_text(encoding=encoding, errors=errors)
-
-
-def write_json(path: Path, obj: Any) -> None:
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+    return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def requests_get(
     url: str,
-    timeout: int = 60,
+    timeout: int = 120,
     retries: int = 4,
-    backoff: float = 2.0,
+    backoff: float = 1.7,
+    headers: Optional[Dict[str, str]] = None,
     binary: bool = False,
-) -> Union[requests.Response, bytes]:
+) -> Union[str, bytes]:
+    """GET with retries. Returns text (default) or bytes (binary=True)."""
     last = None
     for i in range(retries):
         try:
-            r = requests.get(url, timeout=timeout)
+            r = requests.get(url, timeout=timeout, headers=headers)
             if r.status_code >= 500:
                 raise RuntimeError(f"ServerError {r.status_code}: {r.text[:200]}")
             r.raise_for_status()
-            return r.content if binary else r
+            return r.content if binary else r.text
         except Exception as e:
             last = e
             time.sleep(backoff ** i)
-    raise last  # type: ignore
+    raise last
 
 
-def requests_post_json(url: str, payload: Dict[str, Any], timeout: int = 120, retries: int = 4, backoff: float = 2.0) -> Dict[str, Any]:
-    headers = {"content-type": "application/json"}
-    last = None
-    for i in range(retries):
-        try:
-            r = requests.post(url, data=json.dumps(payload), headers=headers, timeout=timeout)
-            if r.status_code >= 500:
-                raise RuntimeError(f"ServerError {r.status_code}: {r.text[:200]}")
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last = e
-            time.sleep(backoff ** i)
-    raise last  # type: ignore
-
-
-def download_file(url: str, out_path: Path, timeout: int = 120, retries: int = 4, backoff: float = 2.0, chunk: int = 1 << 20) -> Path:
-    """
-    Download URL to out_path. Skips download if file exists and non-empty.
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists() and out_path.stat().st_size > 0:
-        return out_path
-
-    last = None
-    for i in range(retries):
-        try:
-            with requests.get(url, stream=True, timeout=timeout) as r:
-                if r.status_code >= 500:
-                    raise RuntimeError(f"ServerError {r.status_code}: {r.text[:200]}")
-                r.raise_for_status()
-                with open(out_path, "wb") as f:
-                    for b in r.iter_content(chunk_size=chunk):
-                        if b:
-                            f.write(b)
-            if out_path.stat().st_size == 0:
-                raise RuntimeError(f"Downloaded empty file: {out_path}")
-            return out_path
-        except Exception as e:
-            last = e
-            if out_path.exists():
-                try:
-                    out_path.unlink()
-                except Exception:
-                    pass
-            time.sleep(backoff ** i)
-
-    raise last  # type: ignore
-
-
-def parse_href_list_from_html(html: str) -> List[str]:
-    """
-    NCBI ftp directory listings are simple HTML with <a href="...">.
-    Return raw href values.
-    """
+def parse_ftp_dir_listing(html: str) -> List[str]:
+    """Parse a simple NCBI ftp web directory listing page and return linked names."""
+    # NCBI's directory listing is plain HTML with <a href="filename">filename</a>
+    # We only need the href target names.
     hrefs = re.findall(r'href="([^"]+)"', html, flags=re.IGNORECASE)
-    # Remove parent links, dirs
-    hrefs = [h for h in hrefs if h and not h.startswith("?") and h not in ("../", "./")]
-    return hrefs
-
-
-def parse_ftp_dir_listing(html_or_resp: Union[str, requests.Response]) -> List[str]:
-    """Parse an NCBI GEO FTP directory HTML listing.
-
-    Historically different parts of the codebase expected either the raw HTML string
-    or a ``requests.Response`` object. This helper supports both.
-
-    Returns a list of *names* (file/dir names), not full URLs.
-    """
-    if hasattr(html_or_resp, "text"):
-        html = getattr(html_or_resp, "text")
-    else:
-        html = str(html_or_resp)
-
-    hrefs = parse_href_list_from_html(html)
-    out: List[str] = []
-    seen = set()
+    out = []
     for h in hrefs:
-        # strip querystring and any leading path
-        h2 = h.split("?", 1)[0]
-        h2 = h2.rstrip("/")
-        name = h2.split("/")[-1] if "/" in h2 else h2
-        if not name or name in ("..", "."):
+        h = h.strip()
+        if h in ("../", "./"):
             continue
-        if name not in seen:
-            seen.add(name)
-            out.append(name)
-    return out
+        # The listing sometimes includes absolute or query URLs; keep only basename-ish.
+        h = h.split("?")[0]
+        # filter anchors and oddities
+        if not h or h.startswith("#"):
+            continue
+        out.append(h)
+    # keep order but deduplicate
+    seen = set()
+    dedup = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            dedup.append(x)
+    return dedup
+
+
+def read_table_auto(path: Union[str, Path], nrows: Optional[int] = None) -> pd.DataFrame:
+    """Read txt/tsv/csv(.gz) into DataFrame with delimiter sniffing."""
+    path = Path(path)
+    # pandas can read gz directly
+    # delimiter sniff: try tab then comma
+    for sep in ("\t", ","):
+        try:
+            df = pd.read_csv(path, sep=sep, nrows=nrows, low_memory=False)
+            if df.shape[1] > 1:
+                return df
+        except Exception:
+            pass
+    # fallback: whitespace
+    return pd.read_csv(path, sep=r"\s+", nrows=nrows, engine="python", low_memory=False)
+
+
+def normalize_gene_symbol(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    return s.upper()
+
+
+def normalize_gse(s: str) -> str:
+    s = (s or "").strip().upper()
+    if not s.startswith("GSE"):
+        return s
+    return s
