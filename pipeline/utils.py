@@ -183,3 +183,23 @@ def normalize_gene_symbol(s: str) -> str:
 def normalize_gse(s: str) -> str:
     s = (s or "").strip().upper()
     return s
+
+
+
+def download_file(url, out_path_or_dir, fname=None, timeout=240, retries=4, backoff=1.7, overwrite=False):
+    from pathlib import Path
+    out = Path(out_path_or_dir)
+    out_str = str(out_path_or_dir)
+    dir_like = (fname is not None) or out_str.endswith("/") or (out.exists() and out.is_dir()) or (out.suffix == "")
+    if dir_like:
+        if fname is None:
+            fname = url.split("/")[-1].split("?")[0]
+        out = out / fname
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists() and out.stat().st_size > 0 and not overwrite:
+        return out
+    data = requests_get(url, timeout=timeout, retries=retries, backoff=backoff, binary=True)
+    out.write_bytes(data)
+    return out
+
+
