@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import gzip
+import io
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import pandas as pd
+
+from .ftp import download_geo_suppl_file, get_geo_matrix_files, get_geo_suppl_files, rank_bulk_matrix_candidates
+
+
+def _open_text(path: Path):
+    """Open plain text or .gz text with best-effort decoding."""
+    if str(path).endswith('.gz'):
+        return gzip.open(path, 'rt', encoding='utf-8', errors='ignore')
+    return open(path, 'rt', encoding='utf-8', errors='ignore')
+
+
+def read_geo_series_matrix(path: Path) -> pd.DataFrame:
+    """Parse a GEO *series matrix* (GSE*_series_matrix.txt(.gz)).
+
+    The table is delimited by:
+      !series_matrix_table_begin
+      ...tab-delimited table...
+      !series_matrix_table_end
+
+    Returns a dataframe with rows=features (ID_REF) and columns=GSM*.
+    """
+    begin = None
+    end = None
+    lines: List[str] = []
+    with _open_text(path) as fh:
+        for line in fh:
+            l = line.strip('\n')
+            low = l.lower()
+            if begin is None:
+                if low.startswith('!series_matrix_table_begin'):
+                    begin = True
+                continue
+            # begin already seen
+            if low.startswith('!series_matrix_table_end'):
+                end = True
+                break
+            lines.append(l)
+
+    if begin is None or end is None:
+        raise RuntimeError('Not a valid GEO series matrix file (missing table markers).')
+    if not lines:
+        raise RuntimeError('Series matrix table is empty.')
+
+    df = pd.read_csv(io.StringIO('\n'.join(lines)), sep='\t')
+    if df.shape[1] < 2:
+        raise RuntimeError('Series matrix parsed but has <2 columns.')
+
+    first = df.columns[0]
+    df = df.set_index(first)
+    # drop any all-NA columns
+    df = df.dropna(axis=1, how='all')
+    return df
+
+
+def read_matrix_generic(path: Path) -> pd.DataFrame:
+    """Read a generic expression matrix in common tabular formats.
+
+    Supported:
+      - .csv/.tsv/.txt with optional gzip
+      - GEO series matrix (.series_matrix...)
+
+    Output: rows=gene/probe IDs, columns=samples
+    """
+    name_low = path.name.lower()
+    if 'series_matrix' in name_low:
+        return read_geo_series_matrix(path)
+
+    # Heuristic: some series-matrix-like files might start with '!'
+    try:
+        with _open_text(path) as fh:
+            head = fh.readline()
+        if head.lstrip().startswith('!'):
+            # might be series matrix despite filename
+            return read_geo_series_matrix(path)
+    except Exception:
+        pass
+
+    sep = '\t'
+    if path.suffix.lower() == '.csv' or name_low.endswith('.csv.gz'):
+        sep = ','
+
+    df = pd.read_csv(path, sep=sep)
+    # choose first column as index if it looks like gene id
+    if df.shape[1] > 1:
+        df = df.set_index(df.columns[0])
+    # drop columns that are all NA
+    df = df.dropna(axis=1, how='all')
+    return df
+
+
+def download_and_load_matrix(
+    gse: str,
+    raw_gse_dir: Path,
+    timeout: int = 240,
+    min_genes: int = 1000,
+    min_samples: int = 4,
+) -> Tuple[str, Path, pd.DataFrame]:
+    """Download and load an expression matrix for a GSE.
+
+    Strategy:
+      1) Try GEO /suppl directory (processed matrices are often here)
+      2) Try GEO /matrix directory (GSE*_series_matrix.txt.gz lives here)
+      3) Try multiple candidate files and keep the first that looks like an actual
+         expression matrix (enough genes/samples).
+
+    Returns (mode, path, df_expr).
+    """
+    raw_gse_dir.mkdir(parents=True, exist_ok=True)
+
+    files: List[str] = []
+    errs: List[str] = []
+
+    try:
+        files.extend(get_geo_suppl_files(gse, timeout=timeout))
+    except Exception as e:
+        errs.append(f'suppl: {repr(e)}')
+
+    try:
+        files.extend(get_geo_matrix_files(gse, timeout=timeout))
+    except Exception as e:
+        errs.append(f'matrix: {repr(e)}')
+
+    # de-dup while keeping order
+    seen = set()
+    files2: List[str] = []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            files2.append(f)
+    files = files2
+
+    if not files:
+        msg = 'No GEO files listed in suppl/matrix directories.'
+        if errs:
+            msg += ' Errors: ' + '; '.join(errs)
+        raise RuntimeError(msg)
+
+    candidates = rank_bulk_matrix_candidates(files)
+    if not candidates:
+        raise RuntimeError('No candidate matrix-like files after ranking.')
+
+    tried: List[str] = []
+    for rel_path in candidates[:25]:
+        try:
+            local = download_geo_suppl_file(rel_path, raw_gse_dir, timeout=timeout)
+            df = read_matrix_generic(local)
+            # basic sanity checks
+            if df.shape[0] >= min_genes and df.shape[1] >= min_samples:
+                return 'bulk', local, df
+            tried.append(f"{Path(rel_path).name} -> shape={df.shape}")
+        except Exception as e:
+            tried.append(f"{Path(rel_path).name} -> {repr(e)}")
+            continue
+
+    raise RuntimeError(
+        'No suitable bulk matrix after trying candidates. Tried: ' + ' | '.join(tried[:12])
+    )
+
+
+def map_columns_to_gsm_by_text(df_expr: pd.DataFrame, df_meta: pd.DataFrame) -> Dict[str, str]:
+    """Map expression matrix columns to GSM IDs using sample metadata.
+
+    - If column already contains GSM\d+, extract that.
+    - Else, try exact matching to sample titles.
+
+    Returns {old_col -> GSMxxxx}.
+    """
+    mapping: Dict[str, str] = {}
+    title_map = {}
+    if 'title' in df_meta.columns:
+        for gsm, title in df_meta['title'].astype(str).items():
+            title_map[title.strip()] = gsm
+
+    for col in df_expr.columns:
+        c = str(col)
+        if 'GSM' in c:
+            import re
+
+            m = re.search(r'(GSM\d+)', c)
+            if m:
+                mapping[col] = m.group(1)
+                continue
+        # exact title match
+        if c.strip() in title_map:
+            mapping[col] = title_map[c.strip()]
+
+    # keep only mappings that are unique target GSMs
+    inv = {}
+    out = {}
+    for k, v in mapping.items():
+        inv.setdefault(v, []).append(k)
+    for v, ks in inv.items():
+        if len(ks) == 1:
+            out[ks[0]] = v
+    return out
+
+
+def align_expr_and_meta(df_expr: pd.DataFrame, df_meta: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Align expression columns with sample metadata.
+
+    This function tries multiple strategies because GEO matrices often use
+    non-GSM sample names.
+
+    Returns (df_expr_aligned, meta_aligned).
+
+    Important: meta_aligned will include a column 'expr_col' that corresponds to
+    the aligned df_expr_aligned columns. Downstream DE should use that instead of
+    assuming meta index == expression columns.
+    """
+
+    # Ensure meta index is gsm when possible
+    if 'gsm' in df_meta.columns and df_meta.index.name != 'gsm':
+        df_meta = df_meta.set_index('gsm')
+
+    # Strategy 1: direct intersection
+    common = [c for c in df_expr.columns if c in df_meta.index]
+
+    # Strategy 2: rename columns via text mapping
+    if not common:
+        mapping = map_columns_to_gsm_by_text(df_expr, df_meta)
+        if mapping:
+            df_expr2 = df_expr.rename(columns=mapping)
+            common = [c for c in df_expr2.columns if c in df_meta.index]
+            df_expr = df_expr2
+
+    # Strategy 3: fallback by position (same number of samples)
+    if not common:
+        if df_expr.shape[1] == df_meta.shape[0]:
+            meta2 = df_meta.copy()
+            df_expr2 = df_expr.copy()
+            df_expr2.columns = meta2.index.tolist()
+            meta2 = meta2.copy()
+            meta2['expr_col'] = df_expr2.columns.tolist()
+            return df_expr2, meta2
+        raise RuntimeError('Could not align expression columns with sample metadata.')
+
+    # Subset and reorder
+    df_expr2 = df_expr[common].copy()
+    meta2 = df_meta.loc[common].copy()
+    meta2['expr_col'] = df_expr2.columns.tolist()
+    return df_expr2, meta2
