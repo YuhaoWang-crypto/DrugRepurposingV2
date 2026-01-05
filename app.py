@@ -118,6 +118,32 @@ st.sidebar.markdown("---")
 
 st.sidebar.subheader("Config (editable JSON)")
 
+# IMPORTANT (Streamlit): you must NOT modify st.session_state["cfg_editor"] *after*
+# the text_area widget with the same key is instantiated. Put buttons first.
+colA, colB = st.sidebar.columns(2)
+apply_clicked = colA.button("Apply config JSON", use_container_width=True)
+reset_clicked = colB.button("Reset defaults", use_container_width=True)
+
+if reset_clicked:
+    cfg0 = default_config()
+    st.session_state["config"] = cfg0
+    # Safe here because the cfg_editor widget has not been created yet in this run.
+    st.session_state["cfg_editor"] = json.dumps(cfg0, ensure_ascii=False, indent=2)
+    st.sidebar.success("Reset to defaults.")
+
+if apply_clicked:
+    try:
+        cfg_new = json.loads(st.session_state.get("cfg_editor", "{}"))
+        st.session_state["config"] = cfg_new
+        # Normalize editor formatting to what the app is using.
+        st.session_state["cfg_editor"] = json.dumps(cfg_new, ensure_ascii=False, indent=2)
+        st.sidebar.success("Config applied.")
+    except Exception as e:
+        st.sidebar.error(f"Invalid JSON: {e}")
+
+# Editor
+st.sidebar.text_area("Config JSON", key="cfg_editor", height=380)
+
 # Make it obvious when the editor buffer differs from applied config.
 try:
     applied = json.dumps(st.session_state["config"], ensure_ascii=False, sort_keys=True)
@@ -127,26 +153,6 @@ try:
 except Exception:
     # editor may not be valid JSON yet
     pass
-
-st.sidebar.text_area("Config JSON", key="cfg_editor", height=380)
-
-colA, colB = st.sidebar.columns(2)
-with colA:
-    if st.button("Apply config JSON"):
-        try:
-            cfg = json.loads(st.session_state["cfg_editor"])
-            st.session_state["config"] = cfg
-            # Normalize editor formatting to what the app is using.
-            st.session_state["cfg_editor"] = json.dumps(cfg, ensure_ascii=False, indent=2)
-            st.success("Config applied.")
-        except Exception as e:
-            st.error(f"Invalid JSON: {e}")
-with colB:
-    if st.button("Reset defaults"):
-        cfg = default_config()
-        st.session_state["config"] = cfg
-        st.session_state["cfg_editor"] = json.dumps(cfg, ensure_ascii=False, indent=2)
-        st.success("Reset to defaults.")
 
 st.sidebar.markdown("---")
 
@@ -198,7 +204,18 @@ with geo_tab:
     if st.button("Build & Search GEO"):
         add_log("[UI] GEO search started")
         add_log("Queries: " + " | ".join(queries))
+
         df = geo_search_candidates(queries, retmax_each=int(cfg.get("geo_retmax_each", 40)))
+
+        # Normalise candidate schema: some GEO utilities return 'accession' rather than 'gse'.
+        if df is not None and not df.empty:
+            df = df.copy()
+            if "gse" not in df.columns:
+                if "accession" in df.columns:
+                    df["gse"] = df["accession"]
+                elif "Accession" in df.columns:
+                    df["gse"] = df["Accession"]
+
         st.session_state["candidates"] = df
         st.session_state["geo_queries"] = queries
 
@@ -222,7 +239,20 @@ with val_tab:
     if df_cand is None or df_cand.empty:
         st.info("Run GEO search first.")
     else:
-        gse_options = sorted(df_cand["gse"].unique().tolist())
+        # Defensive: some candidate frames may still carry 'accession' instead of 'gse'.
+        if "gse" not in df_cand.columns:
+            if "accession" in df_cand.columns:
+                df_cand = df_cand.copy()
+                df_cand["gse"] = df_cand["accession"].astype(str)
+            elif "Accession" in df_cand.columns:
+                df_cand = df_cand.copy()
+                df_cand["gse"] = df_cand["Accession"].astype(str)
+
+        gse_options = (
+            sorted(df_cand["gse"].astype(str).unique().tolist())
+            if "gse" in df_cand.columns
+            else []
+        )
         selected = st.multiselect("Select GSE to validate", gse_options, default=gse_options[:10])
         if st.button("Validate selected GSE"):
             rows = []
