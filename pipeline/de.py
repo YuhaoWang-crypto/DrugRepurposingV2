@@ -14,23 +14,30 @@ def compute_de_bulk_ttest(df_expr: pd.DataFrame, meta: pd.DataFrame, eps: float 
     if 'condition' not in meta.columns:
         raise RuntimeError('meta is missing required column: condition')
 
+    # Make column name types robust:
+    # Some GEO matrices are parsed with integer column names (e.g., 0..N-1)
+    # when headers are missing/odd. We normalize to string for consistent
+    # membership tests + column selection.
+    df_expr2 = df_expr.copy()
+    df_expr2.columns = df_expr2.columns.map(str)
+
     # Prefer explicit mapping from meta->expression columns
     if 'expr_col' in meta.columns:
         case_cols = meta.loc[meta['condition'] == 'case', 'expr_col'].astype(str).tolist()
         ctrl_cols = meta.loc[meta['condition'] == 'control', 'expr_col'].astype(str).tolist()
         # Keep only columns that actually exist (safety)
-        case_cols = [c for c in case_cols if c in df_expr.columns]
-        ctrl_cols = [c for c in ctrl_cols if c in df_expr.columns]
+        case_cols = [c for c in case_cols if c in df_expr2.columns]
+        ctrl_cols = [c for c in ctrl_cols if c in df_expr2.columns]
     else:
         cond = meta['condition'].astype(str)
-        case_cols = [c for c in df_expr.columns if cond.get(c, 'unknown') == 'case']
-        ctrl_cols = [c for c in df_expr.columns if cond.get(c, 'unknown') == 'control']
+        case_cols = [c for c in df_expr2.columns if cond.get(c, 'unknown') == 'case']
+        ctrl_cols = [c for c in df_expr2.columns if cond.get(c, 'unknown') == 'control']
 
     if len(case_cols) < 2 or len(ctrl_cols) < 2:
         raise RuntimeError(f"Not enough samples for DE: case={len(case_cols)} control={len(ctrl_cols)}")
 
-    X = df_expr[case_cols].to_numpy(dtype=float) + eps
-    Y = df_expr[ctrl_cols].to_numpy(dtype=float) + eps
+    X = df_expr2[case_cols].to_numpy(dtype=float) + eps
+    Y = df_expr2[ctrl_cols].to_numpy(dtype=float) + eps
 
     # log2 fold change
     lfc = np.log2(X.mean(axis=1)) - np.log2(Y.mean(axis=1))
@@ -54,7 +61,7 @@ def compute_de_bulk_ttest(df_expr: pd.DataFrame, meta: pd.DataFrame, eps: float 
     pvals = np.array([2 * norm_sf(abs(z)) if np.isfinite(z) else 1.0 for z in tstat])
 
     df = pd.DataFrame({
-        'gene_raw': df_expr.index.astype(str),
+        'gene_raw': df_expr2.index.astype(str),
         'log2fc': lfc,
         'pval': pvals,
     })
