@@ -123,7 +123,9 @@ st.sidebar.subheader("Config (editable JSON)")
 def _reset_config_callback():
     cfg0 = default_config()
     st.session_state["config"] = cfg0
-    st.session_state["cfg_editor"] = json.dumps(cfg0, ensure_ascii=False, indent=2)
+    # Don't mutate widget-backed state (cfg_editor) directly inside callbacks.
+    # Instead, set a pending buffer that we apply BEFORE rendering the widget.
+    st.session_state["_cfg_editor_pending"] = json.dumps(cfg0, ensure_ascii=False, indent=2)
     st.session_state.pop("_cfg_error", None)
     add_log("[UI] Reset config JSON to defaults")
 
@@ -131,8 +133,10 @@ def _reset_config_callback():
 def _apply_config_callback():
     try:
         cfg_new = json.loads(st.session_state.get("cfg_editor", "{}"))
-        st.session_state["config"] = cfg_new
-        st.session_state["cfg_editor"] = json.dumps(cfg_new, ensure_ascii=False, indent=2)
+        # Merge on top of defaults so missing keys are filled (keeps the pipeline robust)
+        cfg_merged = deep_update(default_config(), cfg_new)
+        st.session_state["config"] = cfg_merged
+        st.session_state["_cfg_editor_pending"] = json.dumps(cfg_merged, ensure_ascii=False, indent=2)
         st.session_state.pop("_cfg_error", None)
         add_log("[UI] Applied config JSON")
     except Exception as e:
@@ -145,6 +149,10 @@ colB.button("Reset defaults", use_container_width=True, on_click=_reset_config_c
 
 if st.session_state.get("_cfg_error"):
     st.sidebar.error(f"Invalid JSON: {st.session_state['_cfg_error']}")
+
+# Apply any pending editor update BEFORE the widget is created.
+if "_cfg_editor_pending" in st.session_state:
+    st.session_state["cfg_editor"] = st.session_state.pop("_cfg_editor_pending")
 
 # Editor
 st.sidebar.text_area("Config JSON", key="cfg_editor", height=380)
@@ -198,13 +206,21 @@ with geo_tab:
     cfg = st.session_state["config"]
 
     genes = [g.strip() for g in genes_in.split(",") if g.strip()]
-    queries = build_geo_queries(
-        genes,
-        phenotype_in,
-        extra_geo_terms,
-        exclude_terms=cfg.get("geo_exclude_terms", []),
-        max_queries=3,
-    )
+
+    # If the user provided explicit GEO queries in the Config JSON, honor them.
+    # Otherwise build queries from the UI inputs.
+    cfg_queries = cfg.get("geo_query_list") or []
+    cfg_queries = [str(q).strip() for q in cfg_queries if str(q).strip()]
+    if cfg_queries:
+        queries = cfg_queries[:3]
+    else:
+        queries = build_geo_queries(
+            genes,
+            phenotype_in,
+            extra_geo_terms,
+            exclude_terms=cfg.get("geo_exclude_terms", []),
+            max_queries=3,
+        )
 
     @st.cache_data(show_spinner=False, ttl=3600)
     def cached_geo_search(queries_tuple: tuple, retmax_each: int):
@@ -295,7 +311,7 @@ with val_tab:
                 try:
                     soft_path = download_soft(gse, Path(cfg.get("project_dir", "./repurpose_pipeline")) / "raw" / gse)
                     meta = parse_soft(soft_path)
-                    meta = label_conditions(meta, cfg)
+                    meta = label_conditions(meta, gse, cfg)
                     c = meta["condition"].value_counts().to_dict()
                     rows.append(
                         {
