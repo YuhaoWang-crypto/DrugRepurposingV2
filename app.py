@@ -15,6 +15,25 @@ from pipeline.pipeline import run_one_gse
 st.set_page_config(page_title="GEO Drug Repurposing Explorer", layout="wide")
 
 
+def deep_update(base, upd):
+    """Recursively merge `upd` into `base`.
+
+    Notes:
+      - dicts are merged key-by-key
+      - lists/scalars are REPLACED (not extended)
+    """
+    if isinstance(base, dict) and isinstance(upd, dict):
+        out = dict(base)
+        for k, v in upd.items():
+            if k in out:
+                out[k] = deep_update(out[k], v)
+            else:
+                out[k] = v
+        return out
+    # replace lists/scalars
+    return upd
+
+
 def _init_state():
     if "config" not in st.session_state:
         st.session_state["config"] = default_config()
