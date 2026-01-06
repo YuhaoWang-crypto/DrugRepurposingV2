@@ -118,28 +118,33 @@ st.sidebar.markdown("---")
 
 st.sidebar.subheader("Config (editable JSON)")
 
-# IMPORTANT (Streamlit): you must NOT modify st.session_state["cfg_editor"] *after*
-# the text_area widget with the same key is instantiated. Put buttons first.
-colA, colB = st.sidebar.columns(2)
-apply_clicked = colA.button("Apply config JSON", use_container_width=True)
-reset_clicked = colB.button("Reset defaults", use_container_width=True)
-
-if reset_clicked:
+# Streamlit quirk: do not mutate st.session_state[...] keys bound to widgets
+# directly in the main body after widget creation. Use callbacks.
+def _reset_config_callback():
     cfg0 = default_config()
     st.session_state["config"] = cfg0
-    # Safe here because the cfg_editor widget has not been created yet in this run.
     st.session_state["cfg_editor"] = json.dumps(cfg0, ensure_ascii=False, indent=2)
-    st.sidebar.success("Reset to defaults.")
+    st.session_state.pop("_cfg_error", None)
+    add_log("[UI] Reset config JSON to defaults")
 
-if apply_clicked:
+
+def _apply_config_callback():
     try:
         cfg_new = json.loads(st.session_state.get("cfg_editor", "{}"))
         st.session_state["config"] = cfg_new
-        # Normalize editor formatting to what the app is using.
         st.session_state["cfg_editor"] = json.dumps(cfg_new, ensure_ascii=False, indent=2)
-        st.sidebar.success("Config applied.")
+        st.session_state.pop("_cfg_error", None)
+        add_log("[UI] Applied config JSON")
     except Exception as e:
-        st.sidebar.error(f"Invalid JSON: {e}")
+        st.session_state["_cfg_error"] = str(e)
+
+
+colA, colB = st.sidebar.columns(2)
+colA.button("Apply config JSON", use_container_width=True, on_click=_apply_config_callback)
+colB.button("Reset defaults", use_container_width=True, on_click=_reset_config_callback)
+
+if st.session_state.get("_cfg_error"):
+    st.sidebar.error(f"Invalid JSON: {st.session_state['_cfg_error']}")
 
 # Editor
 st.sidebar.text_area("Config JSON", key="cfg_editor", height=380)
@@ -201,11 +206,41 @@ with geo_tab:
         max_queries=3,
     )
 
+    @st.cache_data(show_spinner=False, ttl=3600)
+    def cached_geo_search(queries_tuple: tuple, retmax_each: int):
+        # Cached wrapper to reduce NCBI request volume (helps avoid 429/rate-limit).
+        return geo_search_candidates(list(queries_tuple), retmax_each=retmax_each)
+
     if st.button("Build & Search GEO"):
         add_log("[UI] GEO search started")
         add_log("Queries: " + " | ".join(queries))
 
-        df = geo_search_candidates(queries, retmax_each=int(cfg.get("geo_retmax_each", 40)))
+        try:
+            with st.spinner("Searching GEO..."):
+                df = cached_geo_search(tuple(queries), retmax_each=int(cfg.get("geo_retmax_each", 40)))
+
+            # Surface partial failures (e.g. transient NCBI 429/5xx) without crashing the app.
+            errs = []
+            try:
+                errs = (df.attrs or {}).get("errors", []) if df is not None else []
+            except Exception:
+                errs = []
+
+            if errs:
+                st.warning(
+                    f"Some GEO queries failed ({len(errs)}). Showing partial results. "
+                    "If this persists, try lowering geo_retmax_each or simplifying keywords."
+                )
+                # Show only a few to keep UI readable.
+                st.code("\n".join([f"{e.get('query','')}: {e.get('error','')}" for e in errs[:5]]))
+
+        except Exception as e:
+            add_log(f"[ERROR] GEO search failed: {repr(e)}")
+            st.error(
+                "GEO search failed (network/rate-limit or query issue). "
+                "Please try again, or simplify query terms.\n\n" + repr(e)
+            )
+            df = pd.DataFrame()
 
         # Normalise candidate schema: some GEO utilities return 'accession' rather than 'gse'.
         if df is not None and not df.empty:
