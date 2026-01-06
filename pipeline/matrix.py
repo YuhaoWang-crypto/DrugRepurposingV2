@@ -7,6 +7,30 @@ from typing import Dict, List, Tuple
 
 import pandas as pd
 
+import numpy as np
+
+def int_like_fraction(df: pd.DataFrame, max_cells: int = 20000) -> float:
+    """Estimate fraction of values that are (almost) integers.
+
+    Used to guess whether a matrix looks like raw counts vs normalized expression.
+    Returns 0.0 if no numeric values can be sampled.
+    """
+    if df is None or df.empty:
+        return 0.0
+    # sample a small block for speed
+    sub = df.iloc[: min(200, df.shape[0]), : min(20, df.shape[1])]
+    # convert to numeric; ignore non-numeric
+    vals = pd.to_numeric(sub.stack(), errors="coerce").dropna().values
+    if vals.size == 0:
+        return 0.0
+    if vals.size > max_cells:
+        # deterministic subsample
+        rng = np.random.default_rng(0)
+        vals = rng.choice(vals, size=max_cells, replace=False)
+    frac = float(np.mean(np.isclose(vals, np.round(vals), atol=1e-6)))
+    return frac
+
+
 from .ftp import download_geo_suppl_file, get_geo_matrix_files, get_geo_suppl_files, rank_bulk_matrix_candidates
 
 
@@ -72,6 +96,16 @@ def read_matrix_generic(path: Path) -> pd.DataFrame:
     name_low = path.name.lower()
     if 'series_matrix' in name_low:
         return read_geo_series_matrix(path)
+
+    # Excel matrices occasionally appear in /suppl
+    if path.suffix.lower() in ('.xlsx', '.xls'):
+        # pandas uses openpyxl for .xlsx; include it in requirements.txt
+        df = pd.read_excel(path, sheet_name=0)
+        # If the first column looks like an ID column, use it as index
+        if df.shape[1] > 1:
+            df = df.set_index(df.columns[0])
+        df = df.dropna(axis=1, how='all')
+        return df
 
     # Heuristic: some series-matrix-like files might start with '!'
     try:
@@ -203,7 +237,13 @@ def map_columns_to_gsm_by_text(df_expr: pd.DataFrame, df_meta: pd.DataFrame) -> 
     return out
 
 
-def align_expr_and_meta(df_expr: pd.DataFrame, df_meta: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def align_expr_and_meta(
+    df_expr: pd.DataFrame,
+    df_meta: pd.DataFrame,
+    gse: str | None = None,
+    config: dict | None = None,
+    **_kwargs,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Align expression columns with sample metadata.
 
     This function tries multiple strategies because GEO matrices often use
@@ -214,6 +254,11 @@ def align_expr_and_meta(df_expr: pd.DataFrame, df_meta: pd.DataFrame) -> Tuple[p
     Important: meta_aligned will include a column 'expr_col' that corresponds to
     the aligned df_expr_aligned columns. Downstream DE should use that instead of
     assuming meta index == expression columns.
+    
+    Notes:
+      - `gse`/`config` are accepted for backward/forward compatibility with
+        other pipeline versions (they may be used for logging or per-GSE
+        heuristics). This implementation does not require them.
     """
 
     # Ensure meta index is gsm when possible
@@ -247,24 +292,3 @@ def align_expr_and_meta(df_expr: pd.DataFrame, df_meta: pd.DataFrame) -> Tuple[p
     meta2 = df_meta.loc[common].copy()
     meta2['expr_col'] = df_expr2.columns.tolist()
     return df_expr2, meta2
-
-
-import numpy as np
-
-def int_like_fraction(df: pd.DataFrame, max_cells: int = 20000) -> float:
-    """Estimate fraction of values that are (almost) integers.
-    Used to guess whether a matrix looks like counts vs normalized expression.
-    """
-    if df is None or df.empty:
-        return 0.0
-
-    sub = df.iloc[: min(200, df.shape[0]), : min(20, df.shape[1])]
-    vals = pd.to_numeric(sub.stack(), errors="coerce").dropna().values
-    if vals.size == 0:
-        return 0.0
-
-    if vals.size > max_cells:
-        rng = np.random.default_rng(0)
-        vals = rng.choice(vals, size=max_cells, replace=False)
-
-    return float(np.mean(np.isclose(vals, np.round(vals), atol=1e-6)))
