@@ -1,4 +1,4 @@
-# CLCN GEO → Connectivity (L1000CDS2 / L1000FWD / Enrichr) → (optional) PPI → Ranked Drug List
+# GEO → Connectivity (L1000CDS2 / L1000FWD / Enrichr) → (optional) PPI → Ranked Drug List
 
 This is a Streamlit wrapper around a Python pipeline that:
 
